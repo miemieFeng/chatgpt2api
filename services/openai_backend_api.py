@@ -760,6 +760,115 @@ class OpenAIBackendAPI:
         })
         return urls
 
+    def _build_image_prompt(self, prompt: str, size: str) -> str:
+        """把标准图片 prompt 和宽高比转成底层图片生成 prompt。"""
+        if not size or size == "1:1":
+            return prompt
+        if size not in {"16:9", "9:16"}:
+            return f"{prompt.strip()}\n\n输出图片，宽高比为 {size}。"
+        hint = {
+            "16:9": "输出为 16:9 横屏构图，适合宽画幅展示。",
+            "9:16": "输出为 9:16 竖屏构图，适合竖版画幅展示。",
+        }[size]
+        return f"{prompt.strip()}\n\n{hint}"
+
+    def _is_codex_image_model(self, model: str) -> bool:
+        return model == CODEX_IMAGE_MODEL
+
+    def _get_auth_chat_requirements(self) -> ChatRequirements:
+        return self._get_chat_requirements()
+
+    def _parse_image_sse(self, response: requests.Response) -> Dict[str, Any]:
+        """从图片 SSE 里提取 conversation_id、file_ids、sediment_ids。"""
+        conversation_id = ""
+        file_ids: list[str] = []
+        sediment_ids: list[str] = []
+        try:
+            for raw_line in response.iter_lines():
+                if not raw_line:
+                    continue
+                line = raw_line.decode("utf-8", errors="ignore") if isinstance(raw_line, (bytes, bytearray)) else str(raw_line)
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    break
+                if not conversation_id:
+                    match = re.search(r'"conversation_id"\s*:\s*"([^"]+)"', payload)
+                    if match:
+                        conversation_id = match.group(1)
+                for file_id in re.findall(r"(file[-_][A-Za-z0-9]+)", payload):
+                    if file_id not in file_ids:
+                        file_ids.append(file_id)
+                for sediment_id in re.findall(r"sediment://([A-Za-z0-9_-]+)", payload):
+                    if sediment_id not in sediment_ids:
+                        sediment_ids.append(sediment_id)
+        finally:
+            response.close()
+        return {"conversation_id": conversation_id, "file_ids": file_ids, "sediment_ids": sediment_ids}
+
+    def _save_image_bytes(self, image_data: bytes) -> str:
+        file_name = f"{int(time.time())}_{new_uuid().replace('-', '')}.png"
+        relative_dir = Path(time.strftime("%Y"), time.strftime("%m"), time.strftime("%d"))
+        file_path = config.images_dir / relative_dir / file_name
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_bytes(image_data)
+        return f"{config.base_url}/images/{relative_dir.as_posix()}/{file_name}"
+
+    def _image_response(self, urls: list[str], response_format: str) -> Dict[str, Any]:
+        """把图片结果整理成 OpenAI `/v1/images/*` 风格结构。"""
+        if response_format not in {"url", "b64_json"}:
+            raise ValueError("response_format must be 'url' or 'b64_json'")
+        data = []
+        for url in urls:
+            response = self.session.get(url, timeout=120)
+            ensure_ok(response, "image_download")
+            if response_format == "b64_json":
+                data.append({"b64_json": base64.b64encode(response.content).decode()})
+            else:
+                data.append({"url": self._save_image_bytes(response.content)})
+        return {"created": int(time.time()), "data": data}
+
+    def _run_image_task(self, prompt: str, model: str, size: str, images: Optional[list[str]] = None,
+                        response_format: str = "url") -> Dict[str, Any]:
+        """执行图片生成或图片编辑主流程。恢复旧版专用图片链路，避免新版协议层漏取图片结果。"""
+        if not self.access_token:
+            raise RuntimeError("access_token is required for image endpoints")
+        logger.debug({"event": "image_task_start_compat", "prompt": prompt, "model": model, "size": size, "image_count": len(images or [])})
+        references = [self._upload_image(image, f"image_{idx}.png") for idx, image in enumerate(images or [], start=1)]
+        self._bootstrap()
+        requirements = self._get_auth_chat_requirements()
+        final_prompt = self._build_image_prompt(prompt, size)
+        conduit_token = self._prepare_image_conversation(final_prompt, requirements, model)
+        sse = self._start_image_generation(final_prompt, requirements, conduit_token, model, references)
+        sse_result = self._parse_image_sse(sse)
+        logger.debug({"event": "image_sse_result_compat", "sse_result": sse_result})
+        conversation_id = sse_result["conversation_id"]
+        file_ids = list(sse_result["file_ids"])
+        sediment_ids = list(sse_result["sediment_ids"])
+        if conversation_id and not file_ids and not sediment_ids:
+            polled_file_ids, polled_sediment_ids = self._poll_image_results(conversation_id, config.image_poll_timeout_secs)
+            file_ids.extend([item for item in polled_file_ids if item not in file_ids])
+            sediment_ids.extend([item for item in polled_sediment_ids if item not in sediment_ids])
+            logger.debug({"event": "image_polled_result_compat", "conversation_id": conversation_id, "file_ids": polled_file_ids, "sediment_ids": polled_sediment_ids})
+        urls = self._resolve_image_urls(conversation_id, file_ids, sediment_ids)
+        if not urls:
+            raise RuntimeError("no downloadable image result found; " f"conversation_id={conversation_id}, file_ids={file_ids}, sediment_ids={sediment_ids}")
+        return self._image_response(urls, response_format)
+
+    def images_generations(self, prompt: str = "", model: str = "gpt-image-2", size: str = "1:1",
+                           response_format: str = "url") -> Dict[str, Any]:
+        """返回 OpenAI `/v1/images/generations` 风格结果。"""
+        return self._run_image_task(prompt, model, size, response_format=response_format)
+
+    def images_edits(self, image: str | list[str], prompt: str, model: str = "gpt-image-2", size: str = "1:1",
+                     response_format: str = "url") -> Dict[str, Any]:
+        """返回 OpenAI `/v1/images/edits` 风格结果。"""
+        images = [image] if isinstance(image, str) else image
+        if not images:
+            raise ValueError("image is required for image edits")
+        return self._run_image_task(prompt, model, size, images=images, response_format=response_format)
+
     def resolve_conversation_image_urls(
             self,
             conversation_id: str,

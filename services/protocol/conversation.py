@@ -518,73 +518,23 @@ def stream_image_outputs(
         index: int = 1,
         total: int = 1,
 ) -> Iterator[ImageOutput]:
-    last: dict[str, Any] = {}
-    for event in conversation_events(
-            backend,
-            prompt=request.prompt,
-            model=request.model,
-            images=request.images or [],
-            size=request.size,
-    ):
-        last = event
-        if event.get("type") == "conversation.delta":
-            yield ImageOutput(
-                kind="progress",
-                model=request.model,
-                index=index,
-                total=total,
-                text=str(event.get("delta") or ""),
-                upstream_event_type="conversation.delta",
-            )
-            continue
-        if event.get("type") == "conversation.event":
-            raw = event.get("raw")
-            raw_type = str(raw.get("type") or "") if isinstance(raw, dict) else ""
-            yield ImageOutput(
-                kind="progress",
-                model=request.model,
-                index=index,
-                total=total,
-                upstream_event_type=raw_type,
-            )
-
-    conversation_id = str(last.get("conversation_id") or "")
-    file_ids = [str(item) for item in last.get("file_ids") or []]
-    sediment_ids = [str(item) for item in last.get("sediment_ids") or []]
-    message = str(last.get("text") or "").strip()
-    is_text_response = last.get("tool_invoked") is False or last.get("turn_use_case") == "text"
-    logger.info({
-        "event": "image_stream_resolve_start",
-        "conversation_id": conversation_id,
-        "file_ids": file_ids,
-        "sediment_ids": sediment_ids,
-        "tool_invoked": last.get("tool_invoked"),
-        "turn_use_case": last.get("turn_use_case"),
-    })
-    if message and not file_ids and not sediment_ids and (last.get("blocked") or is_text_response):
-        yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=message)
+    result = backend.images_generations(
+        prompt=request.prompt,
+        model=request.model,
+        size=request.size or "1:1",
+        response_format="b64_json",
+    )
+    data = format_image_result(
+        result.get("data") if isinstance(result, dict) else [],
+        request.prompt,
+        request.response_format,
+        request.base_url,
+        int(result.get("created") or time.time()) if isinstance(result, dict) else int(time.time()),
+    )["data"]
+    if data:
+        yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data)
         return
-
-    image_urls = backend.resolve_conversation_image_urls(conversation_id, file_ids, sediment_ids)
-    if image_urls:
-        image_items = [
-            {"b64_json": base64.b64encode(image_data).decode("ascii")}
-            for image_data in backend.download_image_bytes(image_urls)
-        ]
-        data = format_image_result(
-            image_items,
-            request.prompt,
-            request.response_format,
-            request.base_url,
-            int(time.time()),
-        )["data"]
-        if data:
-            yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data)
-        return
-
-    if message:
-        yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=message)
-
+    raise ImageGenerationError("image task returned no image data")
 
 def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[ImageOutput]:
     if str(request.model or "").strip() not in IMAGE_MODELS:
