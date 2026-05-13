@@ -27,10 +27,12 @@
 ### Docker 运行
 
 ```bash
-git clone git@github.com:basketikun/chatgpt2api.git
+git clone git@github.com:miemieFeng/chatgpt2api.git
 cd chatgpt2api
 docker compose up -d
 ```
+
+> 如果要使用本仓库内置的图片接口兼容补丁，请从 `miemieFeng/chatgpt2api` 构建或拉取你自己构建的镜像；直接使用上游 `basketikun/chatgpt2api:latest` 可能不包含这些改造。
 
 启动前请先在 `config.json` 中设置 `auth-key`，也可以在 `docker-compose.yml` 中通过 `CHATGPT2API_AUTH_KEY` 覆盖。
 
@@ -43,7 +45,7 @@ docker compose up -d
 启动后端：
 
 ```bash
-git clone git@github.com:basketikun/chatgpt2api.git
+git clone git@github.com:miemieFeng/chatgpt2api.git
 cd chatgpt2api
 uv sync
 uv run main.py
@@ -78,6 +80,7 @@ environment:
 
 ### API 兼容能力
 
+- 本分支已内置图片接口兼容补丁，`/v1/images/generations` 与 `/v1/images/edits` 会优先走专用图片任务链路，避免新版通用 conversation 事件链路只返回文字或空结果
 - 兼容 `POST /v1/images/generations` 图片生成接口
 - 兼容 `POST /v1/images/edits` 图片编辑接口
 - 兼容面向图片场景的 `POST /v1/chat/completions`
@@ -85,6 +88,7 @@ environment:
 - `GET /v1/models` 返回 `gpt-image-2`、`codex-gpt-image-2`、`auto`、`gpt-5`、`gpt-5-1`、`gpt-5-2`、`gpt-5-3`、`gpt-5-3-mini`、
   `gpt-5-mini`
 - 支持通过 `n` 返回多张生成结果
+- 支持 `size` 传参控制图片比例：`1:1` 默认不额外追加构图提示，`16:9` 会追加横屏构图提示，`9:16` 会追加竖屏构图提示
 - 支持 Codex 中的画图接口逆向，仅 `Plus` / `Team` / `Pro` 订阅可用，模型别名为 `codex-gpt-image-2`，如有需要可自行在其他场景映射回
   `gpt-image-2`，用于和官网画图区分；也就意味着同一账号会同时有官网和 Codex 两份生图额度
 
